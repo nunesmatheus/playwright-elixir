@@ -907,9 +907,8 @@ defmodule Playwright.Frame do
     if Enum.member?(frame.load_states, state) do
       frame
     else
-      # e = Channel.wait_for(frame, :loadstate)
-      {:ok, e} = Channel.wait(session, {:guid, frame.guid}, :loadstate)
-      e.target
+      %Playwright.SDK.Channel.Event{ target: target } = Channel.wait(session, {:guid, frame.guid}, :loadstate)
+      target
     end
   end
 
