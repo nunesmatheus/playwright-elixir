@@ -905,12 +905,12 @@ defmodule Playwright.Frame do
     # Get the specific networkidle options
     idle_timeout = Map.get(options, :idle_timeout, 500)
     max_wait = Map.get(options, :max_wait, 5000)
-    dbg("Using networkidle settings: idle_timeout=#{idle_timeout}ms, max_wait=#{max_wait}ms")
+    browser_timeout = Map.get(options, :timeout, 30_000)
+    dbg("Using networkidle settings: idle_timeout=#{idle_timeout}ms, max_wait=#{max_wait}ms, browser_timeout=#{browser_timeout}ms")
 
     # Special handling for networkidle with debug info
     # We'll track active network requests more safely using process dictionary
     page = frame_to_page(frame)
-    this_pid = self()
 
     # Use process dictionary to track requests - safer than ETS for this use case
     Process.put(:active_network_requests, %{})
@@ -975,19 +975,23 @@ defmodule Playwright.Frame do
     end
 
     # Set up event listeners for request tracking
-    try do
-      if page do
-        Page.on(page, :request, request_tracker)
-        Page.on(page, :request_finished, request_finished_tracker)
-        Page.on(page, :request_failed, request_failed_tracker)
-        Process.put(:request_listeners_added, true)
-      else
-        dbg("Warning: Could not find page to track network requests")
+    listeners_setup =
+      try do
+        if page do
+          Page.on(page, :request, request_tracker)
+          Page.on(page, :request_finished, request_finished_tracker)
+          Page.on(page, :request_failed, request_failed_tracker)
+          Process.put(:request_listeners_added, true)
+          true
+        else
+          dbg("Warning: Could not find page to track network requests")
+          false
+        end
+      catch
+        kind, reason ->
+          dbg("Error setting up network tracking: #{inspect(kind)}, #{inspect(reason)}")
+          false
       end
-    catch
-      kind, reason ->
-        dbg("Error setting up network tracking: #{inspect(kind)}, #{inspect(reason)}")
-    end
 
     # Our own timeout for waiting for network to be truly idle
     start_time = System.system_time(:millisecond)
@@ -1016,35 +1020,88 @@ defmodule Playwright.Frame do
     # Wait until network is truly idle or max wait time is reached
     wait_result =
       try do
-        # First wait for the browser's networkidle signal
-        result = Channel.wait(session, {:guid, frame.guid}, :loadstate, %{
-          predicate: fn _resource, event ->
-            case event.params do
-              %{add: "networkidle"} ->
-                dbg("Browser reported networkidle")
-                true
-              _ -> false
-            end
-          end,
-          timeout: Map.get(options, :timeout, 30_000)
-        })
+        browser_reported_idle = false
 
-        # Then implement our own more aggressive check
-        # Wait until either our conditions are met or the max wait time is reached
-        wait_until = start_time + max_wait
-        network_idle_reached = false
-
-        # Keep checking network idle state until we're satisfied or timeout
-        while_loop = fn loop_fn ->
-          if System.system_time(:millisecond) < wait_until and not Process.get(:network_idle_reached, false) do
-            check_real_network_idle.()
-            :timer.sleep(50)  # Short sleep to avoid burning CPU
-            loop_fn.(loop_fn)
+        # First wait for the browser's networkidle signal with a shorter timeout
+        browser_wait_timeout = min(5000, browser_timeout)
+        browser_wait_result =
+          try do
+            result = Channel.wait(session, {:guid, frame.guid}, :loadstate, %{
+              predicate: fn _resource, event ->
+                case event.params do
+                  %{add: "networkidle"} ->
+                    dbg("Browser reported networkidle")
+                    browser_reported_idle = true
+                    true
+                  _ -> false
+                end
+              end,
+              timeout: browser_wait_timeout
+            })
+            {:ok, result}
+          catch
+            :exit, {:timeout, _} = reason ->
+              dbg("Browser networkidle wait timed out after #{browser_wait_timeout}ms")
+              {:error, reason}
+            kind, reason ->
+              dbg("Error in browser networkidle wait: #{inspect(kind)}, #{inspect(reason)}")
+              {:error, reason}
           end
+
+        # Check if we're already in a networkidle state (might be the case in second call)
+        if Enum.member?(frame.load_states, "networkidle") do
+          dbg("Frame is already in networkidle state")
+          browser_reported_idle = true
         end
 
-        while_loop.(while_loop)
-        result
+        # If browser reported networkidle or we're already in that state, do our own check
+        if browser_reported_idle or elem(browser_wait_result, 0) == :ok do
+          # Then implement our own more aggressive check
+          # Wait until either our conditions are met or the max wait time is reached
+          wait_until = start_time + max_wait
+
+          # Keep checking network idle state until we're satisfied or timeout
+          while_loop = fn loop_fn ->
+            now = System.system_time(:millisecond)
+            if now < wait_until and not Process.get(:network_idle_reached, false) do
+              check_real_network_idle.()
+              :timer.sleep(50)  # Short sleep to avoid burning CPU
+              loop_fn.(loop_fn)
+            else
+              if now >= wait_until do
+                dbg("Max wait time of #{max_wait}ms reached")
+              end
+            end
+          end
+
+          while_loop.(while_loop)
+
+          # Return the browser wait result since we've done our additional checks
+          if elem(browser_wait_result, 0) == :ok do
+            elem(browser_wait_result, 1)
+          else
+            # If we didn't get a browser result but manually detected idle
+            if Process.get(:network_idle_reached, false) do
+              # Create a minimal result that follows the expected pattern
+              %{target: frame}
+            else
+              # Create a frame copy that will work with the rest of the code
+              frame
+            end
+          end
+        else
+          # If browser never reported idle, but we've reached our max timeout,
+          # check idle state one more time before returning
+          check_real_network_idle.()
+
+          # Return a usable result
+          if Process.get(:network_idle_reached, false) do
+            %{target: frame}
+          else
+            # We've tried our best, just return frame
+            frame
+          end
+        end
       catch
         kind, reason ->
           dbg("Error in wait_for_load_state: #{inspect(kind)}, #{inspect(reason)}")
