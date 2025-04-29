@@ -901,15 +901,29 @@ defmodule Playwright.Frame do
   @spec wait_for_load_state(Frame.t(), binary(), options()) :: Frame.t()
   def wait_for_load_state(frame, state \\ "load", options \\ %{})
 
-  def wait_for_load_state(%Frame{session: session} = frame, state, _options)
+  def wait_for_load_state(%Frame{session: session} = frame, state, options)
       when is_binary(state)
       when state in ["load", "domcontentloaded", "networkidle", "commit"] do
+    # If the frame has already reached the required state, return immediately
     if Enum.member?(frame.load_states, state) do
       frame
     else
-      # e = Channel.wait_for(frame, :loadstate)
-      {:ok, e} = Channel.wait(session, {:guid, frame.guid}, :loadstate)
-      e.target
+      # Create a predicate function to check for the specific state
+      predicate = fn resource, event ->
+        case event.params do
+          %{add: add_state} -> add_state == state
+          _ -> false
+        end
+      end
+
+      # Wait for the loadstate event with our predicate to ensure we get the right state
+      with_timeout = Map.merge(%{timeout: 30_000}, options)
+
+      case Channel.wait(session, {:guid, frame.guid}, :loadstate, Map.put(with_timeout, :predicate, predicate)) do
+        {:ok, e} -> e.target
+        %{target: target} -> target
+        _ -> frame
+      end
     end
   end
 
