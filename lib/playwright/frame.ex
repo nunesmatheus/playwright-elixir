@@ -906,8 +906,10 @@ defmodule Playwright.Frame do
       when state in ["load", "domcontentloaded", "networkidle", "commit"] do
     # If the frame has already reached the required state, return immediately
     if Enum.member?(frame.load_states, state) do
+      dbg("already loaded")
       frame
     else
+      dbg("will load")
       # Create a predicate function to check for the specific state
       predicate = fn resource, event ->
         case event.params do
