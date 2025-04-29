@@ -911,7 +911,7 @@ defmodule Playwright.Frame do
     # Set up event listeners for request tracking
     Page.on(page, :request, fn %{params: %{request: request}} ->
       :ets.insert(active_requests, {request.url, System.system_time(:millisecond)})
-      IO.puts("Network request started: #{request.url}")
+      dbg("Network request started: #{request.url}")
       send(this_pid, {:network_request, request.url})
     end)
 
@@ -919,7 +919,7 @@ defmodule Playwright.Frame do
       case :ets.lookup(active_requests, request.url) do
         [{url, start_time}] ->
           duration = System.system_time(:millisecond) - start_time
-          IO.puts("Network request finished: #{url} (took #{duration}ms)")
+          dbg("Network request finished: #{url} (took #{duration}ms)")
           :ets.delete(active_requests, url)
         _ ->
           nil
@@ -931,7 +931,7 @@ defmodule Playwright.Frame do
       case :ets.lookup(active_requests, request.url) do
         [{url, start_time}] ->
           duration = System.system_time(:millisecond) - start_time
-          IO.puts("Network request failed: #{url} (took #{duration}ms)")
+          dbg("Network request failed: #{url} (took #{duration}ms)")
           :ets.delete(active_requests, url)
         _ ->
           nil
@@ -945,7 +945,7 @@ defmodule Playwright.Frame do
         %{add: "networkidle"} ->
           # Check if there are still active requests
           request_count = :ets.info(active_requests, :size)
-          IO.puts("Network idle event received. Active requests: #{request_count}")
+          dbg("Network idle event received. Active requests: #{request_count}")
           true
         _ ->
           false
@@ -959,7 +959,7 @@ defmodule Playwright.Frame do
     result = Channel.wait(session, {:guid, frame.guid}, :loadstate, Map.put(with_timeout, :predicate, predicate))
 
     end_time = System.system_time(:millisecond)
-    IO.puts("Network idle wait took #{end_time - start_time}ms")
+    dbg("Network idle wait took #{end_time - start_time}ms")
 
     # Clean up the table
     :ets.delete(active_requests)
