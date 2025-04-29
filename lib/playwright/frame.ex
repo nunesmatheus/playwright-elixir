@@ -903,49 +903,79 @@ defmodule Playwright.Frame do
 
   def wait_for_load_state(%Frame{session: session} = frame, "networkidle", options) do
     # Special handling for networkidle with debug info
-    # We'll track active network requests by listening to request/requestFinished events
+    # We'll track active network requests more safely using process dictionary
+    # instead of ETS which can cause issues if the process terminates unexpectedly
     page = frame_to_page(frame)
-    active_requests = :ets.new(:active_requests, [:set, :public])
     this_pid = self()
 
+    # Use process dictionary to track requests - safer than ETS for this use case
+    Process.put(:active_network_requests, %{})
+    Process.put(:request_listeners_added, false)
+
+    # Define request tracking functions
+    request_tracker = fn %{params: %{request: request}} ->
+      if Process.get(:request_listeners_added) do
+        requests = Process.get(:active_network_requests, %{})
+        new_requests = Map.put(requests, request.url, System.system_time(:millisecond))
+        Process.put(:active_network_requests, new_requests)
+        dbg("Network request started: #{request.url}")
+      end
+    end
+
+    request_finished_tracker = fn %{params: %{request: request}} ->
+      if Process.get(:request_listeners_added) do
+        requests = Process.get(:active_network_requests, %{})
+        case Map.get(requests, request.url) do
+          nil ->
+            :ok
+          start_time ->
+            duration = System.system_time(:millisecond) - start_time
+            dbg("Network request finished: #{request.url} (took #{duration}ms)")
+            new_requests = Map.delete(requests, request.url)
+            Process.put(:active_network_requests, new_requests)
+        end
+      end
+    end
+
+    request_failed_tracker = fn %{params: %{request: request}} ->
+      if Process.get(:request_listeners_added) do
+        requests = Process.get(:active_network_requests, %{})
+        case Map.get(requests, request.url) do
+          nil ->
+            :ok
+          start_time ->
+            duration = System.system_time(:millisecond) - start_time
+            dbg("Network request failed: #{request.url} (took #{duration}ms)")
+            new_requests = Map.delete(requests, request.url)
+            Process.put(:active_network_requests, new_requests)
+        end
+      end
+    end
+
     # Set up event listeners for request tracking
-    Page.on(page, :request, fn %{params: %{request: request}} ->
-      :ets.insert(active_requests, {request.url, System.system_time(:millisecond)})
-      dbg("Network request started: #{request.url}")
-      send(this_pid, {:network_request, request.url})
-    end)
-
-    Page.on(page, :request_finished, fn %{params: %{request: request}} ->
-      case :ets.lookup(active_requests, request.url) do
-        [{url, start_time}] ->
-          duration = System.system_time(:millisecond) - start_time
-          dbg("Network request finished: #{url} (took #{duration}ms)")
-          :ets.delete(active_requests, url)
-        _ ->
-          nil
+    try do
+      if page do
+        Page.on(page, :request, request_tracker)
+        Page.on(page, :request_finished, request_finished_tracker)
+        Page.on(page, :request_failed, request_failed_tracker)
+        Process.put(:request_listeners_added, true)
+      else
+        dbg("Warning: Could not find page to track network requests")
       end
-      send(this_pid, {:network_request_finished, request.url})
-    end)
-
-    Page.on(page, :request_failed, fn %{params: %{request: request}} ->
-      case :ets.lookup(active_requests, request.url) do
-        [{url, start_time}] ->
-          duration = System.system_time(:millisecond) - start_time
-          dbg("Network request failed: #{url} (took #{duration}ms)")
-          :ets.delete(active_requests, url)
-        _ ->
-          nil
-      end
-      send(this_pid, {:network_request_failed, request.url})
-    end)
+    catch
+      kind, reason ->
+        dbg("Error setting up network tracking: #{inspect(kind)}, #{inspect(reason)}")
+    end
 
     # Create a predicate function to check for the networkidle state
     predicate = fn _resource, event ->
       case event.params do
         %{add: "networkidle"} ->
           # Check if there are still active requests
-          request_count = :ets.info(active_requests, :size)
+          requests = Process.get(:active_network_requests, %{})
+          request_count = map_size(requests)
           dbg("Network idle event received. Active requests: #{request_count}")
+          dbg("Active requests: #{inspect(Map.keys(requests))}")
           true
         _ ->
           false
@@ -956,13 +986,21 @@ defmodule Playwright.Frame do
     with_timeout = Map.merge(%{timeout: 30_000}, options)
     start_time = System.system_time(:millisecond)
 
-    result = Channel.wait(session, {:guid, frame.guid}, :loadstate, Map.put(with_timeout, :predicate, predicate))
+    result =
+      try do
+        Channel.wait(session, {:guid, frame.guid}, :loadstate, Map.put(with_timeout, :predicate, predicate))
+      catch
+        kind, reason ->
+          dbg("Error in wait_for_load_state: #{inspect(kind)}, #{inspect(reason)}")
+          {:error, reason}
+      end
 
     end_time = System.system_time(:millisecond)
     dbg("Network idle wait took #{end_time - start_time}ms")
 
-    # Clean up the table
-    :ets.delete(active_requests)
+    # Clean up
+    Process.delete(:active_network_requests)
+    Process.delete(:request_listeners_added)
 
     case result do
       {:ok, e} -> e.target
