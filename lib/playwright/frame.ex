@@ -15,7 +15,7 @@ defmodule Playwright.Frame do
       the page.  A Frame can be detached from the page only once.
   """
   use Playwright.SDK.ChannelOwner
-  alias Playwright.{ElementHandle, Frame, Locator, Response}
+  alias Playwright.{ElementHandle, Frame, Locator, Response, Page}
   alias Playwright.SDK.{ChannelOwner, Helpers}
 
   @property :load_states
@@ -901,11 +901,81 @@ defmodule Playwright.Frame do
   @spec wait_for_load_state(Frame.t(), binary(), options()) :: Frame.t()
   def wait_for_load_state(frame, state \\ "load", options \\ %{})
 
+  def wait_for_load_state(%Frame{session: session} = frame, "networkidle", options) do
+    # Special handling for networkidle with debug info
+    # We'll track active network requests by listening to request/requestFinished events
+    page = frame_to_page(frame)
+    active_requests = :ets.new(:active_requests, [:set, :public])
+    this_pid = self()
+
+    # Set up event listeners for request tracking
+    Page.on(page, :request, fn %{params: %{request: request}} ->
+      :ets.insert(active_requests, {request.url, System.system_time(:millisecond)})
+      IO.puts("Network request started: #{request.url}")
+      send(this_pid, {:network_request, request.url})
+    end)
+
+    Page.on(page, :request_finished, fn %{params: %{request: request}} ->
+      case :ets.lookup(active_requests, request.url) do
+        [{url, start_time}] ->
+          duration = System.system_time(:millisecond) - start_time
+          IO.puts("Network request finished: #{url} (took #{duration}ms)")
+          :ets.delete(active_requests, url)
+        _ ->
+          nil
+      end
+      send(this_pid, {:network_request_finished, request.url})
+    end)
+
+    Page.on(page, :request_failed, fn %{params: %{request: request}} ->
+      case :ets.lookup(active_requests, request.url) do
+        [{url, start_time}] ->
+          duration = System.system_time(:millisecond) - start_time
+          IO.puts("Network request failed: #{url} (took #{duration}ms)")
+          :ets.delete(active_requests, url)
+        _ ->
+          nil
+      end
+      send(this_pid, {:network_request_failed, request.url})
+    end)
+
+    # Create a predicate function to check for the networkidle state
+    predicate = fn _resource, event ->
+      case event.params do
+        %{add: "networkidle"} ->
+          # Check if there are still active requests
+          request_count = :ets.info(active_requests, :size)
+          IO.puts("Network idle event received. Active requests: #{request_count}")
+          true
+        _ ->
+          false
+      end
+    end
+
+    # Wait for the loadstate event with our predicate
+    with_timeout = Map.merge(%{timeout: 30_000}, options)
+    start_time = System.system_time(:millisecond)
+
+    result = Channel.wait(session, {:guid, frame.guid}, :loadstate, Map.put(with_timeout, :predicate, predicate))
+
+    end_time = System.system_time(:millisecond)
+    IO.puts("Network idle wait took #{end_time - start_time}ms")
+
+    # Clean up the table
+    :ets.delete(active_requests)
+
+    case result do
+      {:ok, e} -> e.target
+      %{target: target} -> target
+      _ -> frame
+    end
+  end
+
   def wait_for_load_state(%Frame{session: session} = frame, state, options)
       when is_binary(state)
       when state in ["load", "domcontentloaded", "networkidle", "commit"] do
-    # For 'networkidle', we always wait since it's a changing state, not a one-time event
-    # Network activity can happen anytime, so we need to ensure we wait for the actual idle state
+    # For non-networkidle states, if already loaded, return immediately
+    # For networkidle, always wait since it's a changing state, not a one-time event
     if state == "networkidle" or not Enum.member?(frame.load_states, state) do
       # Create a predicate function to check for the specific state
       predicate = fn _resource, event ->
@@ -929,13 +999,24 @@ defmodule Playwright.Frame do
     end
   end
 
-  # def wait_for_load_state(%Frame{} = frame, state, options) when is_binary(state) do
-  #   wait_for_load_state(frame, state, options)
-  # end
-
-  # def wait_for_load_state(%Frame{} = frame, options, _) when is_map(options) do
-  #   wait_for_load_state(frame, "load", options)
-  # end
+  # Helper to get the Page from a Frame
+  defp frame_to_page(%Frame{} = frame) do
+    # Assuming there's a parent page relation we can follow
+    # This implementation will need to be adjusted based on your actual object model
+    case Channel.list(frame.session, {:guid, frame.guid}, "Page") do
+      [page | _] -> page
+      _ ->
+        # Alternative approach using parent_frame relationships
+        # This is a best effort to find the page
+        try do
+          # Try to get the main frame's parent page
+          {:ok, page} = Channel.post(frame.session, {:guid, frame.guid}, :parent_page)
+          page
+        rescue
+          _ -> nil
+        end
+    end
+  end
 
   # ---
 
