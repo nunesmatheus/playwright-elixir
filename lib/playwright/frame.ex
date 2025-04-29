@@ -904,14 +904,11 @@ defmodule Playwright.Frame do
   def wait_for_load_state(%Frame{session: session} = frame, state, options)
       when is_binary(state)
       when state in ["load", "domcontentloaded", "networkidle", "commit"] do
-    # If the frame has already reached the required state, return immediately
-    if Enum.member?(frame.load_states, state) do
-      dbg("already loaded")
-      frame
-    else
-      dbg("will load")
+    # For 'networkidle', we always wait since it's a changing state, not a one-time event
+    # Network activity can happen anytime, so we need to ensure we wait for the actual idle state
+    if state == "networkidle" or not Enum.member?(frame.load_states, state) do
       # Create a predicate function to check for the specific state
-      predicate = fn resource, event ->
+      predicate = fn _resource, event ->
         case event.params do
           %{add: add_state} -> add_state == state
           _ -> false
@@ -926,6 +923,9 @@ defmodule Playwright.Frame do
         %{target: target} -> target
         _ -> frame
       end
+    else
+      # For other states, if already loaded, return immediately
+      frame
     end
   end
 
