@@ -48,6 +48,12 @@ defmodule Playwright.SDK.Helpers.Serialization do
     Enum.map(value, &deserialize(&1))
   end
 
+  def deserialize(value) do
+    dbg("Received unsupported value in `Playwright.SDK.Helpers.Serialization.deserialize/1`: #{inspect(value)}")
+    dbg(value)
+    Enum.map(value, &deserialize(&1))
+  end
+
   def serialize(arg) do
     {value, handles} = serialize(arg, [], 0)
     %{value: deep_atomize_keys(value), handles: handles}
